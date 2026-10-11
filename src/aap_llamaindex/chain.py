@@ -3,7 +3,12 @@ from typing import Any, Dict, List, Tuple
 
 from aap_core import utils
 from aap_core.chain import BaseCausalMultiTurnsChain
-from aap_core.types import AgentMessage, ContentType, TokenUsage
+from aap_core.types import (
+    GATED_MODALITIES,
+    AgentMessage,
+    ContentType,
+    TokenUsage,
+)
 from aap_core.utils import extract_repo_id, huggingface_capabilities
 from llama_index.core.base.llms.types import MessageRole, TextBlock
 from llama_index.core.llms import ChatMessage, ChatResponse
@@ -13,9 +18,6 @@ from llama_index.core.tools.types import BaseTool
 from pydantic import Field, PrivateAttr
 
 from aap_llamaindex.utils import media_ref_to_image_block, token_from_response
-
-# Modalities the media gate can consult; detection reports on these.
-_GATED_MODALITIES: Tuple[ContentType, ...] = ("image", "audio", "video", "document")
 
 
 class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatResponse]):
@@ -67,7 +69,7 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
     def _resolve_capabilities(self) -> Dict[ContentType, bool]:
         """Query the metadata sources once, filling gaps from the next source."""
         capabilities = self._ollama_capabilities()
-        if set(capabilities) != set(_GATED_MODALITIES):
+        if set(capabilities) != set(GATED_MODALITIES):
             repo_id = extract_repo_id(self._identifier_candidates())
             if repo_id is not None:
                 for modality, value in huggingface_capabilities(repo_id).items():
