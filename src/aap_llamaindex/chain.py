@@ -17,7 +17,12 @@ from llama_index.core.tools import FunctionTool
 from llama_index.core.tools.types import BaseTool
 from pydantic import Field, PrivateAttr
 
-from aap_llamaindex.utils import media_ref_to_image_block, token_from_response
+from aap_llamaindex.utils import (
+    adapter_capabilities,
+    media_ref_to_audio_block,
+    media_ref_to_image_block,
+    token_from_response,
+)
 
 
 class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatResponse]):
@@ -49,6 +54,10 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         3. Hugging Face model-card metadata, for models identified by repo id
            (HF-native integrations like HuggingFaceLLM or vLLM; needs
            huggingface-hub).
+        4. A ceiling from the adapter's request format itself (see
+           adapter_capabilities), applied last: a transport with no field for a
+           modality cannot deliver it to any model, so it denies what the
+           sources above may have affirmed.
 
         Model-family names carry no weight here: variants of one family differ
         per modality, so name matching misreports exactly the cases that
@@ -67,13 +76,24 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         return dict(self._capabilities_cache)
 
     def _resolve_capabilities(self) -> Dict[ContentType, bool]:
-        """Query the metadata sources once, filling gaps from the next source."""
+        """Query the metadata sources once, filling gaps from the next source.
+
+        The transport ceiling (adapter_capabilities) is applied last and only
+        denies: a request format with no field for a modality cannot deliver it
+        to any model, so it overrides even an affirming server report or model
+        card. An explicit media_support declaration short-circuits detection in
+        the core gate before this method runs, so forcing a modality the
+        transport lacks still reaches the adapter and errors there, by design.
+        """
         capabilities = self._ollama_capabilities()
         if set(capabilities) != set(GATED_MODALITIES):
             repo_id = extract_repo_id(self._identifier_candidates())
             if repo_id is not None:
                 for modality, value in huggingface_capabilities(repo_id).items():
                     capabilities.setdefault(modality, value)
+        for modality, carried in adapter_capabilities(self.model).items():
+            if not carried:
+                capabilities[modality] = False
         return capabilities
 
     def _ollama_capabilities(self) -> Dict[ContentType, bool]:
@@ -82,9 +102,10 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         Duck-typed on purpose: any integration exposing a `.client` with a
         `.show(name)` returning a `capabilities` list gets consulted (the
         ollama-python client does). A non-empty list is read as complete, so
-        absence of "vision" means no image input. Missing client, unknown
-        model on the server, or an offline server report undecidable rather
-        than breaking the request path.
+        absence of "vision" means no image input and absence of "audio" means
+        no audio input. Missing client, unknown model on the server, or an
+        offline server report undecidable rather than breaking the request
+        path.
         """
         name = getattr(self.model, "model", None)
         if not isinstance(name, str):
@@ -99,7 +120,7 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         if not isinstance(capabilities, list) or not capabilities:
             return {}
         lowered = [str(capability).lower() for capability in capabilities]
-        return {"image": "vision" in lowered}
+        return {"image": "vision" in lowered, "audio": "audio" in lowered}
 
     def _identifier_candidates(self) -> List[str]:
         """Model identifiers to test for a Hugging Face repo id, best first.
@@ -129,12 +150,21 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
 
     def _prepare_conversation(self, message: AgentMessage) -> List[ChatMessage]:
         user_prompt = self.user_prompt_template.format(**message.format_kwargs())
+        # One funnel call per modality, because the gate (_modality_ok) is
+        # per-modality and a model may accept images but reject audio. The cost
+        # is that parts arrive grouped by modality rather than in query_media
+        # order; MediaReference carries no source index, so interleaving would
+        # need a core-side change. Video and document are deliberately absent:
+        # mapping them is more than a block swap (VideoBlock exists but no
+        # installed adapter consumes it; DocumentBlock needs a filename).
         images = self._image_parts(message)
+        audios = self._audio_parts(message)
         user_content: str | List[Any] = user_prompt
-        if images:
+        if images or audios:
             user_content = [
                 TextBlock(text=user_prompt),
                 *[media_ref_to_image_block(ref) for ref in images],
+                *[media_ref_to_audio_block(ref) for ref in audios],
             ]
         conversation = [
             ChatMessage(role=MessageRole.SYSTEM, content=self.system_prompt),
