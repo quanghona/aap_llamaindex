@@ -21,6 +21,8 @@ from aap_llamaindex.utils import (
     adapter_capabilities,
     media_ref_to_audio_block,
     media_ref_to_image_block,
+    media_ref_to_video_block,
+    server_capabilities,
     token_from_response,
 )
 
@@ -47,10 +49,10 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         1. What the user declared in media_support ("enabled"/"disabled"). The
            core gate applies that before this method runs, so an explicit
            declaration always wins.
-        2. The Ollama server's capability list for the exact installed revision
-           (`ollama show` -> capabilities, e.g. ["completion", "vision"]).
-           llama-index-core itself carries no capability metadata - LLMMetadata
-           has no capabilities field - so the provider server is asked directly.
+        2. The model's own server reports, through utils.server_capabilities:
+           llama-index-core carries no capability metadata - LLMMetadata has no
+           capabilities field - so provider knowledge lives in the utils layer,
+           not here.
         3. Hugging Face model-card metadata, for models identified by repo id
            (HF-native integrations like HuggingFaceLLM or vLLM; needs
            huggingface-hub).
@@ -85,7 +87,7 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         the core gate before this method runs, so forcing a modality the
         transport lacks still reaches the adapter and errors there, by design.
         """
-        capabilities = self._ollama_capabilities()
+        capabilities = server_capabilities(self.model)
         if set(capabilities) != set(GATED_MODALITIES):
             repo_id = extract_repo_id(self._identifier_candidates())
             if repo_id is not None:
@@ -95,32 +97,6 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
             if not carried:
                 capabilities[modality] = False
         return capabilities
-
-    def _ollama_capabilities(self) -> Dict[ContentType, bool]:
-        """Ask an Ollama-style server what the installed model revision can do.
-
-        Duck-typed on purpose: any integration exposing a `.client` with a
-        `.show(name)` returning a `capabilities` list gets consulted (the
-        ollama-python client does). A non-empty list is read as complete, so
-        absence of "vision" means no image input and absence of "audio" means
-        no audio input. Missing client, unknown model on the server, or an
-        offline server report undecidable rather than breaking the request
-        path.
-        """
-        name = getattr(self.model, "model", None)
-        if not isinstance(name, str):
-            return {}
-        try:
-            show = getattr(self.model.client, "show", None)
-            if show is None:
-                return {}
-            capabilities = show(name).capabilities
-        except Exception:  # noqa: BLE001 - detection must never break invoke()
-            return {}
-        if not isinstance(capabilities, list) or not capabilities:
-            return {}
-        lowered = [str(capability).lower() for capability in capabilities]
-        return {"image": "vision" in lowered, "audio": "audio" in lowered}
 
     def _identifier_candidates(self) -> List[str]:
         """Model identifiers to test for a Hugging Face repo id, best first.
@@ -154,17 +130,20 @@ class ChatCausalMultiTurnsChain(BaseCausalMultiTurnsChain[ChatMessage, ChatRespo
         # per-modality and a model may accept images but reject audio. The cost
         # is that parts arrive grouped by modality rather than in query_media
         # order; MediaReference carries no source index, so interleaving would
-        # need a core-side change. Video and document are deliberately absent:
-        # mapping them is more than a block swap (VideoBlock exists but no
-        # installed adapter consumes it; DocumentBlock needs a filename).
+        # need a core-side change. Video is a container, never frames: the
+        # bytes go to the model as one video part and frame sampling stays the
+        # provider's decision. Document is absent: DocumentBlock requires a
+        # filename MediaReference does not carry.
         images = self._image_parts(message)
         audios = self._audio_parts(message)
+        videos = self._video_parts(message)
         user_content: str | List[Any] = user_prompt
-        if images or audios:
+        if images or audios or videos:
             user_content = [
                 TextBlock(text=user_prompt),
                 *[media_ref_to_image_block(ref) for ref in images],
                 *[media_ref_to_audio_block(ref) for ref in audios],
+                *[media_ref_to_video_block(ref) for ref in videos],
             ]
         conversation = [
             ChatMessage(role=MessageRole.SYSTEM, content=self.system_prompt),
