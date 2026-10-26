@@ -763,7 +763,13 @@ class TestMediaRefToAudioBlock:
         )
         assert isinstance(block, AudioBlock)
         assert str(block.url) == "http://x/a.wav"
-        assert block.format is None  # not fetched, so not sniffed
+        # The contract is what OUR call guarantees: no inline payload, no
+        # format token passed. AudioBlock >=0.14.13 additionally derives a
+        # format from the URL suffix at construction (no fetch); older cores
+        # leave it None. Accept both, reject anything else -- a value not
+        # traceable to the ".wav" suffix means the mapping regressed.
+        assert block.audio is None
+        assert block.format in (None, "wav")
 
     def test_base64_ref_roundtrips_byte_exact(self):
         raw = WAV_MAGIC
